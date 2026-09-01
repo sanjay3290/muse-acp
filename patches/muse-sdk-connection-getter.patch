@@ -1,0 +1,13 @@
+--- a/vendor/muse-sdk/src/facade/client.ts
++++ b/vendor/muse-sdk/src/facade/client.ts
+@@ -273,6 +273,11 @@ export class MuseClient {
+     return this.#durability;
+   }
+ 
++  /** Raw MSP connection — exposed for out-of-band commands like turn/cancel. */
++  get connection(): Connection {
++    return this.#connection;
++  }
++
+   /** Open a new root session (tdd SS2.5.1). */
+   async startSession(options: StartSessionOptions = {}): Promise<Session> {

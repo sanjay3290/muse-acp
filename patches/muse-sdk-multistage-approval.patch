@@ -1,0 +1,169 @@
+diff --git a/vendor/muse-sdk/src/facade/approval.ts b/vendor/muse-sdk/src/facade/approval.ts
+index 8dbebf0..19a6ba1 100644
+--- a/vendor/muse-sdk/src/facade/approval.ts
++++ b/vendor/muse-sdk/src/facade/approval.ts
+@@ -15,7 +15,11 @@
+ 
+ import type { Connection } from "../connection/connection.js";
+ 
+-import type { ApprovalDecideParams, ApprovalRequestParams } from "@muse-code/msp";
++import type {
++  ApprovalDecideParams,
++  ApprovalRequestParams,
++  ApprovalUpdatedParams,
++} from "@muse-code/msp";
+ 
+ /** Errors (TS2344) when `T` is inhabited — i.e. when a member is unforwarded. */
+ type AssertNever<T extends never> = T;
+@@ -96,6 +100,19 @@ export class ApprovalRouter {
+    */
+   readonly #decidedStages = new Set<string>();
+ 
++  /**
++   * The `approval/requested` still open per `approvalId`.
++   *
++   * A multi-stage shell approval (`wc a.txt; echo x`) is asked for ONCE. Muse
++   * advances stage 2..N with `approval/updated` alone and never re-issues the
++   * request, so a router driven only by `requested()` decides stage 1 and the
++   * approval — and the whole turn — pends forever. `updated()` needs the
++   * request-shape members (`itemId`, `turnId`, `toolName`, `toolCallId`,
++   * `rawArgs`) that an update does not carry, and this is where they live.
++   * Dropped on `resolved()`, so a post-resolve update authors nothing.
++   */
++  readonly #openRequests = new Map<string, ApprovalRequestParams>();
++
+   constructor(sessionId: string, connection: Connection | undefined) {
+     this.#sessionId = sessionId;
+     this.#connection = connection;
+@@ -128,6 +145,7 @@ export class ApprovalRouter {
+   requested(params: ApprovalRequestParams): Promise<void> | undefined {
+     const handler = this.#handler;
+     if (handler === undefined) return undefined;
++    this.#openRequests.set(params.approvalId, params);
+     const stage = ApprovalRouter.#stageKey(params);
+     if (this.#decidedStages.has(stage)) return undefined;
+     // Latched BEFORE the first await: a redelivery folded on the very next
+@@ -137,6 +155,58 @@ export class ApprovalRouter {
+     return this.#decide(params, handler);
+   }
+ 
++  /**
++   * An `approval/updated` folded. Same contract as {@link requested}: the
++   * decision round trip to await, or `undefined` when this client authors
++   * nothing for it.
++   *
++   * Only a stage this router has NOT decided produces a decision, and only for
++   * an approval whose request it still holds. The per-stage latch is the same
++   * one `requested()` uses, so the ordinary single-stage echo — an update that
++   * merely reports the stage just decided — authors nothing.
++   */
++  updated(params: ApprovalUpdatedParams): Promise<void> | undefined {
++    const handler = this.#handler;
++    if (handler === undefined) return undefined;
++    const origin = this.#openRequests.get(params.approvalId);
++    // An update for an approval this router never answered describes a stage
++    // it cannot honestly shape into a request. The fold drops the same frame
++    // for the same reason.
++    if (origin === undefined) return undefined;
++    const advanced = ApprovalRouter.#advance(origin, params);
++    const stage = ApprovalRouter.#stageKey(advanced);
++    if (this.#decidedStages.has(stage)) return undefined;
++    this.#decidedStages.add(stage);
++    return this.#decide(advanced, handler);
++  }
++
++  /** An `approval/resolved` folded: no further stage can open under this id. */
++  resolved(approvalId: string): void {
++    this.#openRequests.delete(approvalId);
++  }
++
++  /**
++   * The next stage as a REQUEST.
++   *
++   * The update is authoritative for everything it carries — the stage, its
++   * choices, the re-parsed subject — because a decide against the previous
++   * stage's values bounces -32053/-32052. The original supplies only the
++   * request-shape members the update has no field for.
++   */
++  static #advance(
++    origin: ApprovalRequestParams,
++    update: ApprovalUpdatedParams,
++  ): ApprovalRequestParams {
++    return {
++      ...origin,
++      availableChoices: update.availableChoices,
++      currentRequirementId: update.currentRequirementId,
++      sourceRange: update.sourceRange,
++      subject: update.subject,
++      viewCursor: update.viewCursor,
++    };
++  }
++
+   static #stageKey(params: ApprovalRequestParams): string {
+     const requirement = params.currentRequirementId;
+     return `${params.approvalId} ${requirement.approvalId}:${String(requirement.sourceIndex)}`;
+diff --git a/vendor/muse-sdk/src/facade/session.ts b/vendor/muse-sdk/src/facade/session.ts
+index 4100562..193346d 100644
+--- a/vendor/muse-sdk/src/facade/session.ts
++++ b/vendor/muse-sdk/src/facade/session.ts
+@@ -53,6 +53,7 @@ import type { FoldedItem, Turn } from "./turn-handle.js";
+ 
+ import type {
+   ApprovalRequestParams,
++  ApprovalUpdatedParams,
+   Item,
+   ItemDeltaParams,
+   ItemKind,
+@@ -510,6 +511,22 @@ export class Session<I = unknown> {
+         if (outcome.kind === "approvalPending") this.#approvalRequested(known.params, tasks);
+         break;
+ 
++      case "approval/updated":
++        // An UPDATE refreshes a pending approval and never opens one — but on
++        // a MULTI-STAGE approval it is also the only frame that advances the
++        // stage. Muse asks once with `approval/requested` and then reports
++        // stage 2..N here; a client that drives its handler from the request
++        // alone decides stage 1 and the approval pends forever, taking the
++        // turn with it. The router carries the request-shape members forward
++        // from the original, so the handler still sees a whole request.
++        if (outcome.kind === "approvalPending") this.#approvalUpdated(known.params, tasks);
++        break;
++
++      case "approval/resolved":
++        // No further stage can open under this id; drop the router's carry.
++        this.#approvals.resolved(known.params.approvalId);
++        break;
++
+       // Folded, deliberately NOT routed to a turn handle. Listed rather than
+       // defaulted so this switch is exhaustive over `ViewEvent`: the fold's
+       // `AssertNever` forces each new #206 view notification into that union,
+@@ -522,14 +539,6 @@ export class Session<I = unknown> {
+       case "view/gap":
+       case "turn/retracted": // the turn still reaches its own terminal
+       case "turn/retryScheduled": // non-terminal by contract (SS4.5.1)
+-      // An UPDATE refreshes a pending approval; it never opens one, and it
+-      // carries none of the request-shape members (`itemId`, `turnId`,
+-      // `toolName`) an `ApprovalHandler` is typed on. SS5.6.3: a re-issued
+-      // REQUEST embodies the refresh, and that is the frame that drives the
+-      // handler — so calling it from here would either lie about the request
+-      // or need a second, thinner handler type for one wire event.
+-      case "approval/updated":
+-      case "approval/resolved":
+       case "userInput/requested":
+       case "userInput/settled":
+       case "session/modelChanged":
+@@ -852,6 +861,14 @@ export class Session<I = unknown> {
+     return out;
+   }
+ 
++  #approvalUpdated(
++    params: ApprovalUpdatedParams,
++    tasks: Promise<readonly PendingRetirement<I>[]>[],
++  ): void {
++    const decided = this.#approvals.updated(params);
++    if (decided !== undefined) tasks.push(decided.then(() => []));
++  }
++
+   #approvalRequested(
+     params: ApprovalRequestParams,
+     tasks: Promise<readonly PendingRetirement<I>[]>[],

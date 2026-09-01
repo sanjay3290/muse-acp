@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": false,
+    "paths": {
+      "@muse-code/msp": ["./vendor/msp-ts/index.d.ts"]
+    }
+  },
+  "include": ["src/**/*", "vendor/muse-sdk/src/**/*", "vendor/msp-ts/**/*"],
+  "exclude": ["dist", "node_modules"]
+}

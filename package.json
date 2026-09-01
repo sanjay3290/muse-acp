@@ -1,0 +1,32 @@
+{
+  "name": "muse-acp",
+  "version": "0.1.0",
+  "description": "ACP adapter for Muse Code — bridges Agent Client Protocol to Muse Session Protocol via @muse-code/sdk",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "muse-acp": "./dist/src/cli.js"
+  },
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "files": ["dist", "vendor", "LICENSE", "NOTICE"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "start": "node dist/src/cli.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}

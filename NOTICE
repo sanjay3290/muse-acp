@@ -1,0 +1,28 @@
+muse-acp
+Copyright 2026 The muse-acp Authors
+
+This product includes software developed at
+Meta Platforms, Inc. and affiliates.
+
+--------------------------------------------------------------------------------
+THIRD-PARTY COMPONENTS
+--------------------------------------------------------------------------------
+
+The following directories contain third-party code that is NOT covered by the
+Apache License 2.0 that applies to the rest of this repository. Each is
+redistributed under its own license, reproduced in full alongside the code.
+
+1. vendor/muse-sdk/
+   Source of @muse-code/sdk, from https://github.com/meta-models/muse-code-sdk
+   Copyright (c) Meta Platforms, Inc. and affiliates.
+   Licensed under the MIT License. See vendor/muse-sdk/LICENSE.
+
+   Local modifications are applied on top of upstream and are documented in
+   patches/ (see README, "Vendored SDK patches"):
+     - patches/muse-sdk-connection-getter.patch
+     - patches/muse-sdk-multistage-approval.patch
+
+2. vendor/msp-ts/
+   Generated MSP wire-type declarations from the same upstream project.
+   Copyright (c) Meta Platforms, Inc. and affiliates.
+   Licensed under the MIT License. See vendor/msp-ts/LICENSE.
