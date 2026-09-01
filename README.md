@@ -24,7 +24,7 @@ Content blocks (`text`, `image`, `resource`, `resource_link`, `audio`) are mappe
 ## Install
 
 ```sh
-git clone https://github.com/<owner>/muse-acp
+git clone https://github.com/sanjay3290/muse-acp
 cd muse-acp
 npm install
 npm run build
