@@ -5,7 +5,7 @@
  * The adapter owns the mapping and emits via onSessionUpdate callback.
  */
 
-import type { SessionUpdate } from "../acp/types.js";
+import type { SessionUpdate, ToolKind } from "@agentclientprotocol/sdk";
 import { logger } from "../util/logger.js";
 
 /** MSP item kinds (from msp.d.ts ItemKind). */
@@ -56,7 +56,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
           sessionUpdate: "tool_call_update",
           toolCallId: (item.toolCallId as string) ?? item.itemId,
           content: [{ type: "content", content: { type: "text", text: delta } }],
-        } as unknown as SessionUpdate,
+        },
       ];
     }
     // Fallback: treat as agent message
@@ -82,7 +82,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
             : item.visibleOutput
               ? [{ type: "content", content: { type: "text", text: item.visibleOutput as string } }]
               : undefined,
-        } as unknown as SessionUpdate,
+        },
       ];
     }
     if (kind === "agentMessage" && item.text) {
@@ -110,7 +110,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
         title: toolName,
         kind: toolToAcpKind(toolName),
         status: "in_progress",
-      } as unknown as SessionUpdate,
+        },
     ];
   }
 
@@ -118,7 +118,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
   return [];
 }
 
-function toolToAcpKind(toolName: string): string {
+export function toolToAcpKind(toolName: string): ToolKind {
   const t = toolName.toLowerCase();
   if (t.includes("read") || t === "read_file" || t === "readfile") return "read";
   if (t.includes("write") || t.includes("edit") || t === "write_file" || t === "edit_file") return "edit";

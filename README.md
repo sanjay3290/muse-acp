@@ -110,9 +110,7 @@ const stopReason = await mgr.sendTurn(session.sessionId,
 src/
   cli.ts              # shebang entry, arg parsing, ACP stdio loop
   acp/
-    protocol.ts       # ACP JSON-RPC ndjson transport (stdin/stdout)
-    server.ts         # ACP Agent side (initialize, session/new, prompt, cancel)
-    types.ts          # ACP wire types
+    agent.ts          # ACP Agent handlers registered on @agentclientprotocol/sdk
   msp/
     manager.ts        # MuseClient lifecycle (spawn, handshake, session store)
   bridge/
@@ -142,10 +140,13 @@ Two local patches are applied on top of the vendor tree and will be lost on re-v
 
 ## Protocol notes
 
-- **ACP version**: 1. `agentCapabilities` advertises `image`, `embeddedContext`, `loadSession`.
+- **ACP version**: 1, over the official [`@agentclientprotocol/sdk`](https://www.npmjs.com/package/@agentclientprotocol/sdk). The SDK owns framing, routing and schema validation; this repo owns only the MSP translation. SDK 1.x carries the stable ACP v1 wire schema — its `experimental/v2` entry point is a separate, unstable surface and is not used.
+- **Capabilities**: `loadSession`, and `promptCapabilities` `image` + `embeddedContext`.
+- **Stop reasons**: ACP's vocabulary is `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, `cancelled` — there is no `failed`. A turn that times out, errors, or loses its host rejects `session/prompt` with a JSON-RPC error instead of resolving with a stop reason. The 120s deadline also sends `turn/cancel` to muse so the host stops working a turn the client has been told about.
+- **`session/cancel` is a notification.** A client that sends it as a request gets `-32601`.
 - **MSP fingerprint**: pinned from `muse-code-sdk` schema manifest (`sha256:…`). Verified on `initialize` handshake (advisory, via `fingerprint.ts`).
 - **One `muse serve` per adapter**: `MuseClient` multiplexes many ACP sessions over one `muse serve` child (one `Connection`). Each `session/new` maps to one MSP `session/start`.
-- **Approvals**: `Session.onApproval` → ACP `session/request_permission` → `approval/decide`. Default-deny if no handler.
+- **Approvals**: `Session.onApproval` → ACP `session/request_permission` → `approval/decide`. Default-deny if no handler, if the client cancels, or if the request errors. MSP's `decision` + `scope` map onto ACP's four `PermissionOptionKind` values (`allow_once`, `allow_always`, `reject_once`, `reject_always`) — a scope that outlives the call is "always".
 - **Multi-stage approvals**: a compound shell command (`wc -c f.txt; cat f.txt`) is ONE muse approval with one stage per command. Muse asks for each stage in turn, so the ACP client sees **N separate `session/request_permission` calls for one tool call**. Expected, not a bug — in Zed that is several prompts for one command. Stage 1 arrives as `approval/requested`; stages 2..N arrive as `approval/updated` (see the vendor patch above).
 - **Streaming**: `TurnHandle.deltas()` + `TurnHandle.items()` are consumed concurrently; `TurnHandle.completed` (`Promise<TurnOutcome>`) drives `stopReason`.
 

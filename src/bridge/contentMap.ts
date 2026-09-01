@@ -5,7 +5,7 @@
  * MSP Item (agentMessage/toolCall)     →  ACP SessionUpdate
  */
 
-import type { ContentBlock } from "../acp/types.js";
+import type { ContentBlock } from "@agentclientprotocol/sdk";
 
 // MSP input shape (from @muse-code/msp TurnStartParams)
 export interface MspInputBlock {

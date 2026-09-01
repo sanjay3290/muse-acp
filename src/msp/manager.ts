@@ -11,8 +11,9 @@ import type { Session } from "../../vendor/muse-sdk/src/index.js";
 import type { InitializeResult } from "../../vendor/msp-ts/msp.d.ts";
 import { resolveMuseBin } from "../util/env.js";
 import { logger } from "../util/logger.js";
-import type { SessionUpdate } from "../acp/types.js";
-import { itemToSessionUpdates, StreamingDedup } from "../bridge/streaming.js";
+import { RequestError } from "@agentclientprotocol/sdk";
+import type { SessionUpdate, RequestPermissionResponse, ToolCallUpdate, PermissionOption } from "@agentclientprotocol/sdk";
+import { itemToSessionUpdates, StreamingDedup, toolToAcpKind } from "../bridge/streaming.js";
 import type { MspInputBlock } from "../bridge/contentMap.js";
 
 export interface SessionRecord {
@@ -25,7 +26,73 @@ export interface SessionRecord {
 
 export interface SendTurnOptions {
   onSessionUpdate: (update: SessionUpdate) => void;
-  onRequestPermission?: (toolCall: unknown, options: unknown[]) => Promise<unknown>;
+  onRequestPermission?: (
+    toolCall: ToolCallUpdate,
+    options: PermissionOption[],
+  ) => Promise<RequestPermissionResponse>;
+}
+
+/**
+ * How long a turn may run before the adapter stops waiting on it.
+ *
+ * A net, not a policy: every hang this has ever caught was a bug, and the
+ * point is to hand the client a real error instead of a request that never
+ * answers. ACP has no "failed" stop reason — the vocabulary is `end_turn`,
+ * `max_tokens`, `max_turn_requests`, `refusal`, `cancelled` — so a turn that
+ * dies rejects `session/prompt` rather than resolving it with a stop reason
+ * the schema does not carry.
+ */
+const TURN_TIMEOUT_MS = 120_000;
+
+/** Distinguishes the deadline from a turn error, which is reported differently. */
+class TurnTimeout extends Error {
+  constructor() {
+    super(`turn timeout after ${TURN_TIMEOUT_MS / 1000}s`);
+  }
+}
+
+/** An MSP choice, as much of it as the mapping below reads. */
+interface MspChoice {
+  choiceId: string;
+  label: string;
+  decision: string;
+  scope?: string;
+}
+
+/**
+ * MSP's `decision` + `scope` → ACP's `PermissionOptionKind`.
+ *
+ * ACP's vocabulary is four values — `allow_once`, `allow_always`,
+ * `reject_once`, `reject_always` — and it encodes PERSISTENCE as well as
+ * polarity. MSP splits the same two facts across `decision` (`approved…` /
+ * `denied…` / `abort`) and `scope` (`once` / `session` / `localPersistent`),
+ * so both are read. A scope that outlives the single call is "always".
+ */
+function permissionOptionKind(choice: MspChoice): PermissionOption["kind"] {
+  const allow = choice.decision.startsWith("approved");
+  const always = choice.scope === "session" || choice.scope === "localPersistent";
+  if (allow) return always ? "allow_always" : "allow_once";
+  return always ? "reject_always" : "reject_once";
+}
+
+/**
+ * The choice to take when nobody chose: an explicit denial if the host offers
+ * one, else the first choice. Never a silent approval.
+ */
+function denyChoice(choices: readonly MspChoice[]): string {
+  const deny = choices.find((c) => c.decision.startsWith("denied") || c.decision === "abort");
+  return deny?.choiceId ?? choices[0]?.choiceId ?? "";
+}
+
+/** `rawArgs` is a JSON string on the wire; ACP's `rawInput` wants the object. */
+function safeJsonParse(raw: string | undefined): Record<string, unknown> | undefined {
+  if (!raw) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export class MspManager {
@@ -108,37 +175,33 @@ export class MspManager {
     record.mspSession.onApproval(async (req) => {
       const handler = this.#permissionHandlers.get(record.sessionId);
       logger.info("Approval requested", { approvalId: req.approvalId, toolName: req.toolName, sessionId: record.sessionId });
-      if (!handler) {
-        // No handler for this session's current turn — deny by default
-        const deny = req.availableChoices.find((c) => typeof c.decision === "string" && c.decision.startsWith("denied"));
-        return { choiceId: deny?.choiceId ?? req.availableChoices[0]?.choiceId ?? "" };
-      }
+      if (!handler) return { choiceId: denyChoice(req.availableChoices) };
       try {
-        const result = (await handler(
+        const result = await handler(
           {
             toolCallId: req.toolCallId,
             title: req.toolName,
-            kind: "execute",
+            kind: toolToAcpKind(req.toolName),
             status: "pending",
-            rawInput: req.rawArgs,
+            rawInput: safeJsonParse(req.rawArgs),
           },
           req.availableChoices.map((c) => ({
             optionId: c.choiceId,
             name: c.label,
-            kind: typeof c.decision === "string" && c.decision.startsWith("approved") ? "allow" : "reject",
+            kind: permissionOptionKind(c),
           })),
-        )) as { outcome?: { optionId?: string }; optionId?: string } | undefined;
-        const optionId =
-          (result as { outcome?: { optionId?: string } })?.outcome?.optionId ??
-          (result as { optionId?: string })?.optionId ??
-          req.availableChoices[0]?.choiceId ??
-          "";
-        logger.info("Approval decided", { approvalId: req.approvalId, choiceId: optionId });
-        return { choiceId: optionId };
+        );
+        // A client that cancels the turn answers `cancelled` rather than
+        // picking. Denying is the only safe reading of "no choice was made".
+        if (result.outcome.outcome !== "selected") {
+          logger.info("Permission request cancelled by client", { approvalId: req.approvalId });
+          return { choiceId: denyChoice(req.availableChoices) };
+        }
+        logger.info("Approval decided", { approvalId: req.approvalId, choiceId: result.outcome.optionId });
+        return { choiceId: result.outcome.optionId };
       } catch (e) {
         logger.warn("Permission request failed, denying", { error: String(e) });
-        const deny = req.availableChoices.find((c) => typeof c.decision === "string" && c.decision.startsWith("denied"));
-        return { choiceId: deny?.choiceId ?? req.availableChoices[0]?.choiceId ?? "" };
+        return { choiceId: denyChoice(req.availableChoices) };
       }
     });
     record.mspSession.onApprovalError((failure) => {
@@ -166,7 +229,7 @@ export class MspManager {
     sessionId: string,
     input: MspInputBlock[],
     options: SendTurnOptions,
-  ): Promise<"end_turn" | "cancelled" | "failed"> {
+  ): Promise<"end_turn" | "cancelled"> {
     const record = this.#sessions.get(sessionId);
     if (!record) throw Object.assign(new Error(`Session not found: ${sessionId}`), { code: -32002 });
 
@@ -190,13 +253,11 @@ export class MspManager {
       record.activeTurnId = turn.turnId;
     } catch (e) {
       record.activeTurnAbort = undefined;
-      logger.error("sendUserTurn failed", { error: String(e) });
       const msg = e instanceof Error ? e.message : String(e);
-      options.onSessionUpdate({
-        sessionUpdate: "agent_message_chunk",
-        content: { type: "text", text: `\n[Error sending turn: ${msg}]\n` },
-      });
-      return "failed";
+      logger.error("sendUserTurn failed", { sessionId, error: msg });
+      // The turn never started, so there is no turn to report a stop reason
+      // for. Rejecting `session/prompt` is the honest answer.
+      throw RequestError.internalError({ sessionId }, `could not start turn: ${msg}`);
     }
 
     const dedup = new StreamingDedup();
@@ -208,22 +269,13 @@ export class MspManager {
       const streaming = this.#streamViaTurn(turn, options.onSessionUpdate, dedup, abort.signal);
       // Safety timeout: tool turns should complete in well under 5m; if turn.completed
       // never settles (raced iterators, lost routing), don't hang the ACP response forever.
+      let timer: ReturnType<typeof setTimeout> | undefined;
       const outcome = await Promise.race([
         this.#waitForCompleted(turn.completed, abort.signal),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("turn timeout after 120s")), 120_000),
-        ),
-      ]).catch((e) => {
-        if ((e as Error).message.includes("turn timeout")) {
-          logger.error("Turn timed out — returning failed to unblock ACP", { sessionId, turnId: turn.turnId });
-          // Tell muse to drop it too. Without this the host keeps waiting on a
-          // turn the ACP client has already been told failed, and the next
-          // prompt on this session queues behind a turn nobody will finish.
-          void this.cancelTurn(sessionId).catch(() => {});
-          return { kind: "completed", params: { terminal: "failed" } } as unknown;
-        }
-        throw e;
-      });
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new TurnTimeout()), TURN_TIMEOUT_MS);
+        }),
+      ]).finally(() => clearTimeout(timer));
 
       // Now that the terminal is known, give streaming a short drain window then abort.
       // Abortable iteration above ensures `abort` actually breaks a stuck `next()`.
@@ -236,22 +288,46 @@ export class MspManager {
       logger.info("Turn outcome", { sessionId, outcomeKind: (outcome as { kind?: string })?.kind });
 
       const outcomeKind = (outcome as { kind?: string })?.kind;
-      if (outcomeKind === "cancelled") return "cancelled";
-      if (outcomeKind === "terminalUnknown") return "failed";
-      if (outcomeKind === "unqueued") return "cancelled";
+      if (outcomeKind === "cancelled" || outcomeKind === "unqueued") return "cancelled";
+      // SS2.13.3b: the host died and no terminal is coming. Not a stop reason —
+      // the turn's fate is genuinely unknown, which is an error, not an ending.
+      if (outcomeKind === "terminalUnknown") {
+        throw RequestError.internalError(
+          { sessionId, turnId: turn.turnId },
+          "muse host died; turn terminal unknown",
+        );
+      }
       if (outcomeKind === "completed") {
         const terminal = (outcome as { params?: { terminal?: string } })?.params?.terminal;
         if (terminal === "cancelled") return "cancelled";
-        if (terminal === "failed") return "failed";
+        if (terminal === "failed") {
+          const error = (outcome as { params?: { error?: { message?: string } } })?.params?.error;
+          throw RequestError.internalError(
+            { sessionId, turnId: turn.turnId },
+            `turn failed: ${error?.message ?? "no reason given"}`,
+          );
+        }
         return "end_turn";
       }
-      // Fallback: if abort was signalled but outcome is something else, still treat as cancelled
+      // Aborted with an outcome that names no terminal: the cancel is the fact.
       if (abort.signal.aborted) return "cancelled";
       return "end_turn";
     } catch (e) {
+      if (e instanceof TurnTimeout) {
+        logger.error("Turn timed out", { sessionId, turnId: turn.turnId });
+        // Tell muse to drop it too, or the host keeps working a turn the client
+        // has already been told about, and the next prompt on this session
+        // queues behind a turn nobody will finish.
+        await this.cancelTurn(sessionId).catch(() => {});
+        throw RequestError.internalError(
+          { sessionId, turnId: turn.turnId },
+          `turn exceeded ${TURN_TIMEOUT_MS / 1000}s and was cancelled`,
+        );
+      }
       if (abort.signal.aborted) return "cancelled";
-      logger.error("Turn streaming error", { error: String(e) });
-      return "failed";
+      if (e instanceof RequestError) throw e;
+      logger.error("Turn streaming error", { sessionId, error: String(e) });
+      throw RequestError.internalError({ sessionId }, `turn failed: ${String(e)}`);
     } finally {
       record.activeTurnAbort = undefined;
       record.activeTurnId = undefined;

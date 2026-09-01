@@ -1,15 +1,42 @@
 {
   "name": "muse-acp",
   "version": "0.1.0",
-  "description": "ACP adapter for Muse Code — bridges Agent Client Protocol to Muse Session Protocol via @muse-code/sdk",
+  "description": "ACP adapter for Muse Code \u2014 bridges Agent Client Protocol to Muse Session Protocol via @muse-code/sdk",
   "license": "Apache-2.0",
+  "author": "sanjay3290",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sanjay3290/muse-acp.git"
+  },
+  "homepage": "https://github.com/sanjay3290/muse-acp#readme",
+  "bugs": {
+    "url": "https://github.com/sanjay3290/muse-acp/issues"
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "muse",
+    "muse-code",
+    "zed",
+    "jetbrains",
+    "coding-agent",
+    "jsonrpc",
+    "stdio",
+    "adapter",
+    "msp"
+  ],
   "type": "module",
   "bin": {
     "muse-acp": "./dist/src/cli.js"
   },
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
-  "files": ["dist", "vendor", "LICENSE", "NOTICE"],
+  "files": [
+    "dist",
+    "vendor",
+    "LICENSE",
+    "NOTICE"
+  ],
   "engines": {
     "node": ">=20"
   },
@@ -22,7 +49,10 @@
     "lint": "tsc --noEmit",
     "prepublishOnly": "npm run build"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@agentclientprotocol/sdk": "^1.4.0",
+    "zod": "^4.0.0"
+  },
   "devDependencies": {
     "@types/node": "^22.7.0",
     "tsx": "^4.19.0",

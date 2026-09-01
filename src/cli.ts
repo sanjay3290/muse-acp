@@ -8,8 +8,9 @@
  *   muse-acp --help
  */
 
-import { AcpProtocol } from "./acp/protocol.js";
-import { AcpServer } from "./acp/server.js";
+import { agent, ndJsonStream } from "@agentclientprotocol/sdk";
+import { Readable, Writable } from "node:stream";
+import { registerAgent } from "./acp/agent.js";
 import { MspManager } from "./msp/manager.js";
 import { logger, setLogLevel } from "./util/logger.js";
 
@@ -85,46 +86,20 @@ async function main(): Promise<void> {
 
   const mspManager = new MspManager();
 
-  // Wire ACP protocol
-  let protocol: AcpProtocol;
+  // stdout carries ACP JSON-RPC and nothing else; the logger writes to stderr.
+  const stream = ndJsonStream(
+    Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+    Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
+  );
 
-  const server = new AcpServer({
-    mspManager,
-    onSessionUpdate: (sessionId, update) => {
-      protocol.notify("session/update", { sessionId, update });
-    },
-    onRequestPermission: async (sessionId, toolCall, options) => {
-      try {
-        const result = await protocol.request("session/request_permission", {
-          sessionId,
-          toolCall,
-          options,
-        } as unknown as Record<string, unknown>);
-        return result;
-      } catch (e) {
-        logger.warn("session/request_permission failed", { error: String(e) });
-        throw e;
-      }
-    },
-  });
+  const connection = registerAgent(agent({ name: "muse-acp" }), mspManager).connect(stream);
 
-  protocol = new AcpProtocol(async (method, params, id) => {
-    // Notifications have no id
-    if (id === undefined) {
-      await server.handleNotification(method, params);
-      return undefined;
-    }
-    return server.handleRequest(method, params, id);
-  });
-
-  // Graceful shutdown
   const shutdown = async (signal: string) => {
     logger.info(`Received ${signal}, shutting down`);
-    try {
-      await mspManager.shutdown();
-    } catch (e) {
+    connection.close();
+    await mspManager.shutdown().catch((e: unknown) => {
       logger.warn("Shutdown error", { error: String(e) });
-    }
+    });
     process.exit(0);
   };
 
@@ -134,9 +109,8 @@ async function main(): Promise<void> {
   logger.info(`muse-acp v${VERSION} starting — ACP over stdio`);
 
   try {
-    await protocol.listen();
-  } catch (e) {
-    logger.error("Protocol error", { error: String(e) });
+    // Resolves when the client closes stdin or the connection errors.
+    await connection.closed;
   } finally {
     await mspManager.shutdown().catch(() => {});
   }
