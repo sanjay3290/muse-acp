@@ -12,6 +12,8 @@
 import { RequestError, methods } from "@agentclientprotocol/sdk";
 import type { AgentApp, AgentContext } from "@agentclientprotocol/sdk";
 import type * as schema from "@agentclientprotocol/sdk";
+import { z } from "zod";
+import { MODEL_CONFIG_ID } from "../msp/manager.js";
 import type { MspManager } from "../msp/manager.js";
 import { contentBlocksToInput } from "../bridge/contentMap.js";
 import { logger } from "../util/logger.js";
@@ -34,6 +36,26 @@ const AGENT_INFO = {
  */
 function sessionNotFound(sessionId: string): RequestError {
   return RequestError.resourceNotFound(`session/${sessionId}`);
+}
+
+/**
+ * ACP's UNSTABLE `session/set_model` (not in SDK 1.x's typed surface; the
+ * wire shape is `{ sessionId, modelId }`). Some clients still send it ahead
+ * of the stable `session/set_config_option`, so it is honoured as a second
+ * spelling of the same gesture rather than answered `-32601`.
+ */
+const SET_MODEL_METHOD = "session/set_model";
+const zSetModelParams = z.object({ sessionId: z.string(), modelId: z.string() });
+
+/**
+ * A client may name a model on `session/new` through `_meta.model` — Paseo
+ * style `provider/model` profiles have nowhere else to put it — so it is
+ * read when present and ignored when it is anything but a non-empty string.
+ */
+function requestedModel(meta: unknown): string | undefined {
+  if (typeof meta !== "object" || meta === null) return undefined;
+  const model = (meta as Record<string, unknown>).model;
+  return typeof model === "string" && model.trim() ? model.trim() : undefined;
 }
 
 export function registerAgent(app: AgentApp, msp: MspManager): AgentApp {
@@ -59,9 +81,13 @@ export function registerAgent(app: AgentApp, msp: MspManager): AgentApp {
     })
 
     .onRequest(methods.agent.session.new, async ({ params }) => {
-      const record = await msp.createSession(params.cwd);
-      logger.info("Created session", { sessionId: record.sessionId, cwd: record.cwd });
-      return { sessionId: record.sessionId } satisfies schema.NewSessionResponse;
+      const record = await msp.createSession(params.cwd, requestedModel(params._meta));
+      logger.info("Created session", { sessionId: record.sessionId, cwd: record.cwd, modelId: record.modelId });
+      const configOptions = await msp.modelConfigOptions(record.sessionId);
+      return {
+        sessionId: record.sessionId,
+        ...(configOptions ? { configOptions } : {}),
+      } satisfies schema.NewSessionResponse;
     })
 
     .onRequest(methods.agent.session.load, async ({ params }) => {
@@ -76,6 +102,27 @@ export function registerAgent(app: AgentApp, msp: MspManager): AgentApp {
         logger.warn("Failed to resume session", { sessionId: params.sessionId, error: String(e) });
         throw sessionNotFound(params.sessionId);
       }
+      const configOptions = await msp.modelConfigOptions(params.sessionId);
+      return { ...(configOptions ? { configOptions } : {}) } satisfies schema.LoadSessionResponse;
+    })
+
+    .onRequest(methods.agent.session.setConfigOption, async ({ params }) => {
+      const { sessionId, configId } = params;
+      if (!msp.hasSession(sessionId)) throw sessionNotFound(sessionId);
+      if (configId !== MODEL_CONFIG_ID) {
+        throw RequestError.invalidParams({ configId, reason: "unknown config option" });
+      }
+      if (typeof params.value !== "string" || !params.value) {
+        throw RequestError.invalidParams({ configId, reason: "model value must be a catalog model id" });
+      }
+      await msp.setModel(sessionId, params.value);
+      const configOptions = (await msp.modelConfigOptions(sessionId)) ?? [];
+      return { configOptions } satisfies schema.SetSessionConfigOptionResponse;
+    })
+
+    .onRequest(SET_MODEL_METHOD, zSetModelParams, async ({ params }) => {
+      if (!msp.hasSession(params.sessionId)) throw sessionNotFound(params.sessionId);
+      await msp.setModel(params.sessionId, params.modelId);
       return {};
     })
 
