@@ -73,9 +73,29 @@ CLI options:
 ```sh
 muse-acp --help
 muse-acp --muse-bin /custom/path/muse --log-level debug
+muse-acp --model muse-spark-1.3
 MUSE_BIN=/custom/muse muse-acp
+MUSE_MODEL=muse-spark-1.3 muse-acp
 MUSE_ACP_LOG_LEVEL=debug muse-acp
 ```
+
+### Choosing a model
+
+Muse's server default is the `-contributor` row of its newest model (as of
+1.0.2, `muse-spark-1.3-contributor`), whose catalog description says your
+content may be used for product improvement. Nothing in the adapter changes
+that default; it only gives you the controls to pick something else:
+
+- `MUSE_MODEL=<id>` (or `--model <id>`) pins every new session to a catalog
+  model id, e.g. `muse-spark-1.3`.
+- `session/new` and `session/load` publish muse's `model/list` catalog as an
+  ACP `configOptions` entry (`id: "model"`, `category: "model"`) with the
+  session's current model, so clients with a model picker show it.
+- `session/set_config_option` with `configId: "model"` switches the model
+  mid-session (MSP `session/setModel`, durable, applied at the next model
+  call). The unstable `session/set_model` is accepted as a second spelling.
+- A client may also name a model per session through `_meta.model` on
+  `session/new`.
 
 Logs go to **stderr only** — stdout is reserved for ACP JSON-RPC.
 
