@@ -31,6 +31,10 @@ Options:
 
 Environment:
   MUSE_BIN              Override muse binary path
+  MUSE_TURN_IDLE_TIMEOUT_MS
+                        Cancel a turn after this much silence from muse
+                        (default 600000 = 10 min; 0 disables). Resets on every
+                        delta, item event, and approval; long turns are fine.
   MUSE_ACP_LOG_LEVEL    Override log level
 
 Protocol:
