@@ -9,11 +9,17 @@
 import { MuseClient } from "../../vendor/muse-sdk/src/index.js";
 import type { Session } from "../../vendor/muse-sdk/src/index.js";
 import type { InitializeResult } from "../../vendor/msp-ts/msp.d.ts";
-import { resolveMuseBin } from "../util/env.js";
+import { resolveMuseBin, resolveTurnIdleTimeoutMs } from "../util/env.js";
+import { IdleTimeout, IdleWatchdog } from "../util/idleWatchdog.js";
 import { logger } from "../util/logger.js";
 import { RequestError } from "@agentclientprotocol/sdk";
-import type { SessionUpdate, RequestPermissionResponse, ToolCallUpdate, PermissionOption } from "@agentclientprotocol/sdk";
-import { itemToSessionUpdates, StreamingDedup, toolToAcpKind } from "../bridge/streaming.js";
+import type {
+  SessionUpdate,
+  RequestPermissionResponse,
+  ToolCallUpdate,
+  PermissionOption,
+} from "@agentclientprotocol/sdk";
+import { deltaToSessionUpdates, itemToSessionUpdates, StreamingDedup, ToolOutputAccumulator, toolToAcpKind } from "../bridge/streaming.js";
 import type { MspInputBlock } from "../bridge/contentMap.js";
 
 export interface SessionRecord {
@@ -33,23 +39,19 @@ export interface SendTurnOptions {
 }
 
 /**
- * How long a turn may run before the adapter stops waiting on it.
+ * A turn is abandoned only when muse goes silent, never for running long.
  *
  * A net, not a policy: every hang this has ever caught was a bug, and the
  * point is to hand the client a real error instead of a request that never
- * answers. ACP has no "failed" stop reason — the vocabulary is `end_turn`,
- * `max_tokens`, `max_turn_requests`, `refusal`, `cancelled` — so a turn that
- * dies rejects `session/prompt` rather than resolving it with a stop reason
- * the schema does not carry.
+ * answers. The first cut was a fixed 120s wall clock, which also cancelled
+ * perfectly healthy turns that happened to run a long build or read a lot of
+ * files. The watchdog now resets on every delta, item event, and approval
+ * round trip (see {@link resolveTurnIdleTimeoutMs} for the knob). ACP has no
+ * "failed" stop reason — the vocabulary is `end_turn`, `max_tokens`,
+ * `max_turn_requests`, `refusal`, `cancelled` — so a turn that dies rejects
+ * `session/prompt` rather than resolving it with a stop reason the schema
+ * does not carry.
  */
-const TURN_TIMEOUT_MS = 120_000;
-
-/** Distinguishes the deadline from a turn error, which is reported differently. */
-class TurnTimeout extends Error {
-  constructor() {
-    super(`turn timeout after ${TURN_TIMEOUT_MS / 1000}s`);
-  }
-}
 
 /** An MSP choice, as much of it as the mapping below reads. */
 interface MspChoice {
@@ -102,6 +104,8 @@ export class MspManager {
   #starting = false;
   // Per-session current permission handler — swapped per turn, read by the single onApproval
   #permissionHandlers = new Map<string, SendTurnOptions["onRequestPermission"]>();
+  /** Per-session activity hooks; an approval round trip counts as the turn being alive. */
+  #activity = new Map<string, () => void>();
 
   /** Ensure MuseClient is spawned and handshaken. Idempotent. */
   async ensureClient(): Promise<MuseClient> {
@@ -176,10 +180,14 @@ export class MspManager {
       const handler = this.#permissionHandlers.get(record.sessionId);
       logger.info("Approval requested", { approvalId: req.approvalId, toolName: req.toolName, sessionId: record.sessionId });
       if (!handler) return { choiceId: denyChoice(req.availableChoices) };
+      this.#activity.get(record.sessionId)?.();
       try {
         const result = await handler(
           {
-            toolCallId: req.toolCallId,
+            // The approval names the toolCall ITEM; that id is what the client
+            // already holds from `tool_call`, so the permission prompt attaches
+            // to the right row instead of an orphan.
+            toolCallId: req.itemId,
             title: req.toolName,
             kind: toolToAcpKind(req.toolName),
             status: "pending",
@@ -261,21 +269,26 @@ export class MspManager {
     }
 
     const dedup = new StreamingDedup();
-    logger.info("Turn started", { sessionId, turnId: turn.turnId });
+    const outputs = new ToolOutputAccumulator();
+    const idleTimeoutMs = resolveTurnIdleTimeoutMs();
+    const watchdog = new IdleWatchdog(idleTimeoutMs);
+    this.#activity.set(sessionId, () => watchdog.touch());
+    const onUpdate: SendTurnOptions["onSessionUpdate"] = (update) => {
+      watchdog.touch();
+      options.onSessionUpdate(update);
+    };
+    logger.info("Turn started", { sessionId, turnId: turn.turnId, idleTimeoutMs });
 
     try {
       // Start streaming first so that turn/started and early deltas are not missed,
       // but don't let a stuck stream block the response — completion is the source of truth.
-      const streaming = this.#streamViaTurn(turn, options.onSessionUpdate, dedup, abort.signal);
-      // Safety timeout: tool turns should complete in well under 5m; if turn.completed
-      // never settles (raced iterators, lost routing), don't hang the ACP response forever.
-      let timer: ReturnType<typeof setTimeout> | undefined;
+      const streaming = this.#streamViaTurn(turn, onUpdate, dedup, outputs, abort.signal);
+      // Inactivity watchdog: if turn.completed never settles (raced iterators, lost
+      // routing, dead host) AND nothing is arriving, don't hang the ACP response forever.
       const outcome = await Promise.race([
         this.#waitForCompleted(turn.completed, abort.signal),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new TurnTimeout()), TURN_TIMEOUT_MS);
-        }),
-      ]).finally(() => clearTimeout(timer));
+        watchdog.expired,
+      ]).finally(() => watchdog.dispose());
 
       // Now that the terminal is known, give streaming a short drain window then abort.
       // Abortable iteration above ensures `abort` actually breaks a stuck `next()`.
@@ -313,15 +326,15 @@ export class MspManager {
       if (abort.signal.aborted) return "cancelled";
       return "end_turn";
     } catch (e) {
-      if (e instanceof TurnTimeout) {
-        logger.error("Turn timed out", { sessionId, turnId: turn.turnId });
+      if (e instanceof IdleTimeout) {
+        logger.error("Turn went idle", { sessionId, turnId: turn.turnId, idleTimeoutMs });
         // Tell muse to drop it too, or the host keeps working a turn the client
         // has already been told about, and the next prompt on this session
         // queues behind a turn nobody will finish.
         await this.cancelTurn(sessionId).catch(() => {});
         throw RequestError.internalError(
           { sessionId, turnId: turn.turnId },
-          `turn exceeded ${TURN_TIMEOUT_MS / 1000}s and was cancelled`,
+          `turn produced no output for ${idleTimeoutMs / 1000}s and was cancelled (MUSE_TURN_IDLE_TIMEOUT_MS)`,
         );
       }
       if (abort.signal.aborted) return "cancelled";
@@ -329,6 +342,8 @@ export class MspManager {
       logger.error("Turn streaming error", { sessionId, error: String(e) });
       throw RequestError.internalError({ sessionId }, `turn failed: ${String(e)}`);
     } finally {
+      watchdog.dispose();
+      this.#activity.delete(sessionId);
       record.activeTurnAbort = undefined;
       record.activeTurnId = undefined;
       this.#permissionHandlers.delete(sessionId);
@@ -371,6 +386,7 @@ export class MspManager {
       record.activeTurnAbort?.abort();
     }
     this.#permissionHandlers.clear();
+    this.#activity.clear();
     if (this.#client) {
       try {
         await this.#client.close();
@@ -388,6 +404,7 @@ export class MspManager {
     turn: { items(): AsyncIterable<unknown>; deltas(): AsyncIterable<unknown> },
     onUpdate: (update: SessionUpdate) => void,
     dedup: StreamingDedup,
+    outputs: ToolOutputAccumulator,
     signal: AbortSignal,
   ): Promise<void> {
     // Use abortable iteration so that `abort` can break a `for await` waiting on `next()`
@@ -425,12 +442,9 @@ export class MspManager {
         try {
           for await (const delta of abortable(turn.deltas() as AsyncIterable<unknown>, signal) as AsyncIterable<{ itemId?: string; delta?: string; field?: string }>) {
             const d = delta as { itemId?: string; delta?: string; field?: string };
-            if (d.field === "text" && typeof d.delta === "string" && d.itemId) {
-              dedup.recordDelta(d.itemId, d.delta);
-              onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: d.delta } });
-            } else if (typeof d.delta === "string") {
-              onUpdate({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: d.delta } });
-            }
+            if (typeof d.delta !== "string" || !d.itemId) continue;
+            if ((d.field ?? "text") === "text") dedup.recordDelta(d.itemId, d.delta);
+            for (const u of deltaToSessionUpdates({ itemId: d.itemId, delta: d.delta, field: d.field }, outputs)) onUpdate(u);
           }
         } catch (e) {
           if (!signal.aborted) logger.warn("Delta iterator error", { error: String(e) });
