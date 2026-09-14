@@ -24,6 +24,8 @@ Usage:
 
 Options:
   --muse-bin <path>     Path to muse binary (default: auto-detected)
+  --model <id>          Model id for new sessions, e.g. muse-spark-1.3
+                        (default: muse's server default)
   --log-level <level>   Log level: debug, info, warn, error (default: warn)
                         Logs go to stderr only.
   --help, -h            Show this help
@@ -31,6 +33,7 @@ Options:
 
 Environment:
   MUSE_BIN              Override muse binary path
+  MUSE_MODEL            Default model id for new sessions (same as --model)
   MUSE_TURN_IDLE_TIMEOUT_MS
                         Cancel a turn after this much silence from muse
                         (default 600000 = 10 min; 0 disables). Resets on every
@@ -66,12 +69,17 @@ async function main(): Promise<void> {
   // Parse options
   let museBin: string | undefined;
   let logLevel: string | undefined;
+  let model: string | undefined;
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--muse-bin" && args[i + 1]) {
       museBin = args[++i];
     } else if (args[i] === "--log-level" && args[i + 1]) {
       logLevel = args[++i];
+    } else if (args[i] === "--model" && args[i + 1]) {
+      model = args[++i];
+    } else if (args[i]?.startsWith("--model=")) {
+      model = args[i].slice("--model=".length);
     } else if (args[i]?.startsWith("--muse-bin=")) {
       museBin = args[i].split("=")[1];
     } else if (args[i]?.startsWith("--log-level=")) {
@@ -80,6 +88,7 @@ async function main(): Promise<void> {
   }
 
   if (museBin) process.env.MUSE_BIN = museBin;
+  if (model) process.env.MUSE_MODEL = model;
   if (logLevel) {
     process.env.MUSE_ACP_LOG_LEVEL = logLevel;
     setLogLevel(logLevel as never);
