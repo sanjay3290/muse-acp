@@ -9,10 +9,16 @@
 import { MuseClient } from "../../vendor/muse-sdk/src/index.js";
 import type { Session } from "../../vendor/muse-sdk/src/index.js";
 import type { InitializeResult } from "../../vendor/msp-ts/msp.d.ts";
-import { resolveMuseBin } from "../util/env.js";
+import { resolveDefaultModel, resolveMuseBin } from "../util/env.js";
 import { logger } from "../util/logger.js";
 import { RequestError } from "@agentclientprotocol/sdk";
-import type { SessionUpdate, RequestPermissionResponse, ToolCallUpdate, PermissionOption } from "@agentclientprotocol/sdk";
+import type {
+  SessionUpdate,
+  RequestPermissionResponse,
+  ToolCallUpdate,
+  PermissionOption,
+  SessionConfigOption,
+} from "@agentclientprotocol/sdk";
 import { itemToSessionUpdates, StreamingDedup, toolToAcpKind } from "../bridge/streaming.js";
 import type { MspInputBlock } from "../bridge/contentMap.js";
 
@@ -20,6 +26,8 @@ export interface SessionRecord {
   sessionId: string;
   cwd: string;
   mspSession: Session<unknown>;
+  /** The model the session runs on; `undefined` until the host has named one. */
+  modelId?: string;
   activeTurnAbort?: AbortController;
   activeTurnId?: string;
 }
@@ -84,6 +92,24 @@ function denyChoice(choices: readonly MspChoice[]): string {
   return deny?.choiceId ?? choices[0]?.choiceId ?? "";
 }
 
+/** The ACP `configOptions` id under which the model picker is published. */
+export const MODEL_CONFIG_ID = "model";
+
+/** One visible row of muse's `model/list` catalog, as much of it as the mapping reads. */
+export interface MuseModel {
+  modelId: string;
+  displayLabel: string;
+  description: string | null;
+  isDefault: boolean;
+  providerId: string | null;
+  profileId: string | null;
+}
+
+/** The subset of MSP's `Session` record the manager reads back. */
+interface MspSessionRecord {
+  modelId?: string | null;
+}
+
 /** `rawArgs` is a JSON string on the wire; ACP's `rawInput` wants the object. */
 function safeJsonParse(raw: string | undefined): Record<string, unknown> | undefined {
   if (!raw) return undefined;
@@ -141,16 +167,28 @@ export class MspManager {
     return this.#initializeResult;
   }
 
-  async createSession(cwd: string): Promise<SessionRecord> {
+  /**
+   * Open a session on `cwd`. The model is, in order: the one the caller
+   * names, `MUSE_MODEL`, else muse's server default. Whichever wins, the
+   * record learns the id the HOST settled on, read back from `session/read`,
+   * so `modelConfigOptions` reports the truth and not the request.
+   */
+  async createSession(cwd: string, modelId?: string): Promise<SessionRecord> {
     const client = await this.ensureClient();
-    const mspSession = await client.startSession({ workspaceRoot: cwd });
+    const requested = modelId ?? resolveDefaultModel();
+    const mspSession = await client.startSession({
+      workspaceRoot: cwd,
+      ...(requested ? { modelId: requested } : {}),
+    });
     const record: SessionRecord = {
       sessionId: mspSession.sessionId,
       cwd,
       mspSession,
+      modelId: requested,
     };
     this.#sessions.set(mspSession.sessionId, record);
     this.#setupApprovalRouting(record);
+    await this.#refreshModelId(record);
     return record;
   }
 
@@ -166,7 +204,116 @@ export class MspManager {
     };
     this.#sessions.set(mspSession.sessionId, record);
     this.#setupApprovalRouting(record);
+    await this.#refreshModelId(record);
     return record;
+  }
+
+  /**
+   * Read the session's current model off the host. Advisory: a failure
+   * leaves the record's last-known id in place and never fails the caller,
+   * because a session that cannot report its model is still a session that
+   * can take a prompt.
+   */
+  async #refreshModelId(record: SessionRecord): Promise<void> {
+    try {
+      const client = await this.ensureClient();
+      const raw = await client.connection.command("session/read", {
+        sessionId: record.sessionId,
+        excludeItems: true,
+      });
+      const session = (raw as { session?: MspSessionRecord }).session;
+      if (session?.modelId) record.modelId = session.modelId;
+    } catch (e) {
+      logger.debug("session/read for model failed", { sessionId: record.sessionId, error: String(e) });
+    }
+  }
+
+  /**
+   * The visible rows of muse's model catalog, newest first as the host
+   * orders them. Empty is a supported answer (a build with no bundled
+   * models), not an error.
+   */
+  async listModels(sessionId?: string): Promise<MuseModel[]> {
+    const client = await this.ensureClient();
+    const raw = await client.connection.command("model/list", sessionId ? { sessionId } : {});
+    const rows = (raw as { models?: unknown }).models;
+    if (!Array.isArray(rows)) return [];
+    const out: MuseModel[] = [];
+    for (const row of rows) {
+      if (typeof row !== "object" || row === null) continue;
+      const r = row as Record<string, unknown>;
+      if (typeof r.modelId !== "string") continue;
+      out.push({
+        modelId: r.modelId,
+        displayLabel: typeof r.displayLabel === "string" && r.displayLabel ? r.displayLabel : r.modelId,
+        description: typeof r.description === "string" ? r.description : null,
+        isDefault: r.isDefault === true,
+        providerId: typeof r.providerId === "string" ? r.providerId : null,
+        profileId: typeof r.profileId === "string" ? r.profileId : null,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Switch a session's model (MSP `session/setModel`, tdd SS3.8). Durable:
+   * it applies to every later model call. If a turn is running the host
+   * admits it now and applies it at the next model-call boundary.
+   */
+  async setModel(sessionId: string, modelId: string): Promise<void> {
+    const record = this.#sessions.get(sessionId);
+    if (!record) throw RequestError.resourceNotFound(`session/${sessionId}`);
+    const client = await this.ensureClient();
+    // A `ModelSelection` names its provider and profile as well as the model.
+    // The catalog row carries both; a bare id is what the host answers
+    // `invalid_model` to for rows outside the session's current profile.
+    const row = (await this.listModels(sessionId)).find((m) => m.modelId === modelId);
+    const model: Record<string, unknown> = { modelId };
+    if (row) {
+      model.displayLabel = row.displayLabel;
+      if (row.providerId) model.providerId = row.providerId;
+      if (row.profileId) model.profileId = row.profileId;
+    }
+    await client.connection.command("session/setModel", { sessionId, model });
+    record.modelId = modelId;
+    logger.info("Model set", { sessionId, modelId });
+  }
+
+  /**
+   * ACP's picture of the model picker: one `select` config option in the
+   * `model` category whose values are the catalog rows. Absent (not an
+   * empty list) when the catalog cannot be read, so a client sees "no
+   * options" rather than a picker with nothing in it.
+   */
+  async modelConfigOptions(sessionId: string): Promise<SessionConfigOption[] | undefined> {
+    const record = this.#sessions.get(sessionId);
+    if (!record) return undefined;
+    let models: MuseModel[];
+    try {
+      models = await this.listModels(sessionId);
+    } catch (e) {
+      logger.warn("model/list failed", { sessionId, error: String(e) });
+      return undefined;
+    }
+    if (models.length === 0) return undefined;
+    const current =
+      record.modelId && models.some((m) => m.modelId === record.modelId)
+        ? record.modelId
+        : (models.find((m) => m.isDefault) ?? models[0]).modelId;
+    return [
+      {
+        id: MODEL_CONFIG_ID,
+        name: "Model",
+        category: "model",
+        type: "select",
+        currentValue: current,
+        options: models.map((m) => ({
+          value: m.modelId,
+          name: m.displayLabel,
+          ...(m.description ? { description: m.description } : {}),
+        })),
+      },
+    ];
   }
 
   #setupApprovalRouting(record: SessionRecord): void {

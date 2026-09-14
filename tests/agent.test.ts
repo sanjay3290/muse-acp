@@ -19,14 +19,40 @@ type Turn = (
   options: SendTurnOptions,
 ) => Promise<"end_turn" | "cancelled">;
 
-function fakeMsp(overrides: { sendTurn?: Turn } = {}) {
-  const sessions = new Map<string, { sessionId: string; cwd: string }>();
+const CATALOG = [
+  { modelId: "muse-spark-1.3", displayLabel: "muse-spark-1.3", description: null, isDefault: false },
+  { modelId: "muse-spark-1.3-contributor", displayLabel: "muse-spark-1.3-contributor", description: "Your content may be used.", isDefault: true },
+];
+
+function fakeMsp(overrides: { sendTurn?: Turn; models?: typeof CATALOG | "unavailable" } = {}) {
+  const sessions = new Map<string, { sessionId: string; cwd: string; modelId?: string }>();
+  const models = overrides.models ?? CATALOG;
   let n = 0;
   const msp = {
-    createSession: vi.fn(async (cwd: string) => {
-      const rec = { sessionId: `sess-${++n}`, cwd };
+    createSession: vi.fn(async (cwd: string, modelId?: string) => {
+      const rec = { sessionId: `sess-${++n}`, cwd, modelId };
       sessions.set(rec.sessionId, rec);
       return rec;
+    }),
+    setModel: vi.fn(async (sessionId: string, modelId: string) => {
+      const rec = sessions.get(sessionId);
+      if (!rec) throw new Error("no such session");
+      rec.modelId = modelId;
+    }),
+    modelConfigOptions: vi.fn(async (sessionId: string) => {
+      const rec = sessions.get(sessionId);
+      if (!rec || models === "unavailable") return undefined;
+      const current = rec.modelId ?? models.find((m) => m.isDefault)!.modelId;
+      return [
+        {
+          id: "model",
+          name: "Model",
+          category: "model" as const,
+          type: "select" as const,
+          currentValue: current,
+          options: models.map((m) => ({ value: m.modelId, name: m.displayLabel })),
+        },
+      ];
     }),
     resumeSession: vi.fn(async (sessionId: string) => {
       const rec = sessions.get(sessionId);
@@ -61,6 +87,88 @@ describe("initialize", () => {
     expect(res.agentCapabilities?.loadSession).toBe(true);
     expect(res.agentCapabilities?.promptCapabilities).toMatchObject({ image: true, audio: false });
     expect(res.agentInfo?.name).toBe("muse-acp");
+  });
+});
+
+describe("model selection", () => {
+  it("publishes the catalog as a `model` config option on session/new", async () => {
+    const msp = fakeMsp();
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const res = await cx.request(methods.agent.session.new, { cwd: "/tmp/a", mcpServers: [] });
+      const opt = res.configOptions?.find((o) => o.id === "model");
+      expect(opt).toBeDefined();
+      expect(opt?.category).toBe("model");
+      expect(opt).toMatchObject({ type: "select", currentValue: "muse-spark-1.3-contributor" });
+      expect((opt as { options: { value: string }[] }).options.map((o) => o.value)).toEqual([
+        "muse-spark-1.3",
+        "muse-spark-1.3-contributor",
+      ]);
+      expect(msp.createSession).toHaveBeenCalledWith("/tmp/a", undefined);
+    });
+  });
+
+  it("omits configOptions when the catalog is unavailable", async () => {
+    const msp = fakeMsp({ models: "unavailable" });
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const res = await cx.request(methods.agent.session.new, { cwd: "/tmp/a", mcpServers: [] });
+      expect(res.configOptions).toBeUndefined();
+    });
+  });
+
+  it("honours `_meta.model` on session/new", async () => {
+    const msp = fakeMsp();
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const res = await cx.request(methods.agent.session.new, {
+        cwd: "/tmp/a",
+        mcpServers: [],
+        _meta: { model: "muse-spark-1.3" },
+      });
+      expect(msp.createSession).toHaveBeenCalledWith("/tmp/a", "muse-spark-1.3");
+      expect(res.configOptions?.[0]).toMatchObject({ currentValue: "muse-spark-1.3" });
+    });
+  });
+
+  it("session/set_config_option switches the model and echoes the new state", async () => {
+    const msp = fakeMsp();
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const { sessionId } = await cx.request(methods.agent.session.new, { cwd: "/tmp/a", mcpServers: [] });
+      const res = await cx.request(methods.agent.session.setConfigOption, {
+        sessionId,
+        configId: "model",
+        value: "muse-spark-1.3",
+      });
+      expect(msp.setModel).toHaveBeenCalledWith(sessionId, "muse-spark-1.3");
+      expect(res.configOptions[0]).toMatchObject({ id: "model", currentValue: "muse-spark-1.3" });
+    });
+  });
+
+  it("rejects an unknown config option and an unknown session", async () => {
+    const msp = fakeMsp();
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const { sessionId } = await cx.request(methods.agent.session.new, { cwd: "/tmp/a", mcpServers: [] });
+      await expect(
+        cx.request(methods.agent.session.setConfigOption, { sessionId, configId: "nope", value: "x" }),
+      ).rejects.toMatchObject({ code: -32602 });
+      await expect(
+        cx.request(methods.agent.session.setConfigOption, { sessionId: "ghost", configId: "model", value: "x" }),
+      ).rejects.toMatchObject({ code: -32002 });
+      expect(msp.setModel).not.toHaveBeenCalled();
+    });
+  });
+
+  it("unstable session/set_model is a second spelling of the same gesture", async () => {
+    const msp = fakeMsp();
+    await connect(msp)(async (cx) => {
+      await cx.request(methods.agent.initialize, INIT);
+      const { sessionId } = await cx.request(methods.agent.session.new, { cwd: "/tmp/a", mcpServers: [] });
+      await cx.request("session/set_model" as never, { sessionId, modelId: "muse-spark-1.3" } as never);
+      expect(msp.setModel).toHaveBeenCalledWith(sessionId, "muse-spark-1.3");
+    });
   });
 });
 
