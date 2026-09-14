@@ -28,7 +28,6 @@ export interface MspItem {
   status: string;
   text?: string;
   toolName?: string;
-  toolCallId?: string;
   // other fields pass through
   [k: string]: unknown;
 }
@@ -54,7 +53,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
       return [
         {
           sessionUpdate: "tool_call_update",
-          toolCallId: (item.toolCallId as string) ?? item.itemId,
+          toolCallId: item.itemId,
           content: [{ type: "content", content: { type: "text", text: delta } }],
         },
       ];
@@ -66,7 +65,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
   // Completed item — emit final chunks or tool calls
   if (item.status === "completed" || item.status === "failed" || item.status === "cancelled") {
     if (kind === "toolCall") {
-      const toolCallId = (item.toolCallId as string) ?? (item.callId as string) ?? item.itemId;
+      const toolCallId = item.itemId;
       const toolName = (item.tool as string) ?? (item.toolName as string) ?? "tool";
       const status = item.status === "completed" ? "completed" : item.status === "failed" ? "failed" : "pending";
       const acpKind = toolToAcpKind(toolName);
@@ -101,7 +100,7 @@ export function itemToSessionUpdates(item: MspItem, delta?: string): SessionUpda
 
   // item/started — for tool calls, emit tool_call start
   if (item.status === "inProgress" && kind === "toolCall") {
-    const toolCallId = (item.toolCallId as string) ?? (item.callId as string) ?? item.itemId;
+    const toolCallId = item.itemId;
     const toolName = (item.tool as string) ?? (item.toolName as string) ?? "tool";
     return [
       {
@@ -127,6 +126,69 @@ export function toolToAcpKind(toolName: string): ToolKind {
   if (t.includes("fetch") || t.includes("web") || t === "web_fetch") return "fetch";
   if (t.includes("think") || t === "reasoning") return "think";
   return "other";
+}
+
+/** The `item/delta` params this adapter reads (msp.d.ts `ItemDeltaParams`). */
+export interface MspDelta {
+  itemId: string;
+  delta: string;
+  /** Dotted field path; absent means `"text"`. */
+  field?: string;
+}
+
+/**
+ * Accumulates streamed `toolCall.visibleOutput` per item.
+ *
+ * ACP `tool_call_update.content` REPLACES the tool call's content rather than
+ * appending to it, so each output delta has to be re-sent as the whole text
+ * so far, not as the new fragment alone.
+ */
+export class ToolOutputAccumulator {
+  #byItem = new Map<string, string>();
+
+  append(itemId: string, delta: string): string {
+    const next = (this.#byItem.get(itemId) ?? "") + delta;
+    this.#byItem.set(itemId, next);
+    return next;
+  }
+
+  reset(): void {
+    this.#byItem.clear();
+  }
+}
+
+/**
+ * Route one `item/delta` by its field path (tdd SS4.3.1).
+ *
+ * The MSP schema pins which item kinds stream which fields: `agentMessage`
+ * streams `text`; `reasoning` streams `summary.<n>`; `toolCall` and
+ * `userShell` stream `output`. Routing on the field is therefore exact
+ * without knowing the item kind, which a delta does not carry. Before this,
+ * every delta was forwarded as agent prose, so tool stdout and reasoning
+ * summaries landed in the chat transcript as if the model had said them.
+ */
+export function deltaToSessionUpdates(delta: MspDelta, outputs: ToolOutputAccumulator): SessionUpdate[] {
+  if (typeof delta.delta !== "string" || !delta.itemId) return [];
+  const field = delta.field ?? "text";
+  if (field === "text") {
+    return [{ sessionUpdate: "agent_message_chunk", content: { type: "text", text: delta.delta } }];
+  }
+  if (field === "summary" || field.startsWith("summary.")) {
+    return [{ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: delta.delta } }];
+  }
+  if (field === "output") {
+    const soFar = outputs.append(delta.itemId, delta.delta);
+    return [
+      {
+        sessionUpdate: "tool_call_update",
+        toolCallId: delta.itemId,
+        status: "in_progress",
+        content: [{ type: "content", content: { type: "text", text: soFar } }],
+      },
+    ];
+  }
+  logger.debug("Dropping delta on unmapped field", { field, itemId: delta.itemId });
+  return [];
 }
 
 /** Simple dedup helper — tracks streamed text per turn to avoid double-emit. */
